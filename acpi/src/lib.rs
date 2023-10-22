@@ -303,6 +303,19 @@ where
             .ok_or(AcpiError::TableMissing(T::SIGNATURE))
     }
 
+    /// Searches through the ACPI table headers and attempts to locate the table with a matching `T::SIGNATURE`.
+    /// Then maps the entire table and returns a [`PhysicalMapping`] to it.
+    pub fn find_entire_table<T: AcpiTable>(&self) -> AcpiResult<PhysicalMapping<H, u8>> {
+        let header_mapping = self.find_table::<T>()?;
+        // Read header and create mapping for entire table
+        let header = header_mapping.header();
+        let len = header.length;
+        let paddr = header_mapping.physical_start();
+        let mapping = unsafe { self.handler.map_physical_region::<u8>(paddr, len as usize) };
+        drop(header_mapping);
+        Ok(mapping)
+    }
+
     /// Iterates through all of the table headers.
     pub fn headers(&self) -> SdtHeaderIterator<'_, H> {
         SdtHeaderIterator { tables_phys_ptrs: self.tables_phys_ptrs(), handler: self.handler.clone() }
