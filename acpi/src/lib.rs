@@ -156,6 +156,8 @@ pub enum AcpiError {
 pub struct AcpiTables<H: AcpiHandler> {
     mapping: PhysicalMapping<H, SdtHeader>,
     revision: u8,
+    /// Size of each root-table entry in bytes: 4 for RSDT, 8 for XSDT.
+    root_table_entries: u8,
     handler: H,
 }
 
@@ -231,22 +233,25 @@ where
         }
 
         let revision = rsdp_mapping.revision();
-        let root_table_mapping = if revision == 0 {
-            /*
-             * We're running on ACPI Version 1.0. We should use the 32-bit RSDT address.
-             */
 
-            read_root_table!(RSDT, rsdt_address)
-        } else {
+        // Use XSDT if revision > 1 and the XSDT address is present (non-zero).
+        // Otherwise fall back to the RSDT. This matches Linux's ACPICA
+        // implementation in drivers/acpi/acpica/tbutils.c.
+        let (root_table_mapping, root_table_entries) = if revision > 1 && rsdp_mapping.xsdt_address() != 0 {
             /*
              * We're running on ACPI Version 2.0+. We should use the 64-bit XSDT address, truncated
              * to 32 bits on x86.
              */
-
-            read_root_table!(XSDT, xsdt_address)
+            (read_root_table!(XSDT, xsdt_address), 8)
+        } else {
+            /*
+             * We're running on ACPI Version 1.0, or on ACPI 2.0+ without a
+             * valid XSDT address. We should use the 32-bit RSDT address.
+             */
+            (read_root_table!(RSDT, rsdt_address), 4)
         };
 
-        Ok(Self { mapping: root_table_mapping, revision, handler })
+        Ok(Self { mapping: root_table_mapping, revision, root_table_entries, handler })
     }
 
     /// The ACPI revision of the tables enumerated by this structure.
@@ -262,11 +267,7 @@ where
         let ptrs_bytes_len = self.mapping.region_length() - mem::size_of::<SdtHeader>();
         // SAFETY: `ptrs_virt_start` points to an array of `ptrs_bytes_len` bytes that lives as long as `self`.
         let ptrs_bytes = unsafe { core::slice::from_raw_parts(ptrs_virt_start, ptrs_bytes_len) };
-        let ptr_size = if self.revision == 0 {
-            4 // RSDT entry size
-        } else {
-            8 // XSDT entry size
-        };
+        let ptr_size = self.root_table_entries as usize;
 
         ptrs_bytes.chunks(ptr_size).map(|ptr_bytes_src| {
             // Construct a native pointer using as many bytes as required from `ptr_bytes_src` (note that ACPI is
@@ -497,5 +498,96 @@ where
             drop(header_mapping);
             return Some(result);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::ptr::NonNull;
+    use std::{boxed::Box, vec::Vec};
+
+    /// Build a 36-byte RSDP with both checksums valid.
+    fn make_rsdp(revision: u8, rsdt_addr: u32, xsdt_addr: u64, length: u32) -> [u8; 36] {
+        let mut b = [0u8; 36];
+        b[0..8].copy_from_slice(b"RSD PTR ");
+        b[9..15].copy_from_slice(b"TEST01");
+        b[15] = revision;
+        b[16..20].copy_from_slice(&rsdt_addr.to_le_bytes());
+        b[20..24].copy_from_slice(&length.to_le_bytes());
+        b[24..32].copy_from_slice(&xsdt_addr.to_le_bytes());
+        // Standard 20-byte checksum
+        b[8] = 0;
+        let s = b[..20].iter().fold(0u8, |s, &x| s.wrapping_add(x));
+        b[8] = 0u8.wrapping_sub(s);
+        // Extended 36-byte checksum
+        b[32] = 0;
+        let s = b[..36].iter().fold(0u8, |s, &x| s.wrapping_add(x));
+        b[32] = 0u8.wrapping_sub(s);
+        b
+    }
+
+    /// Build an RSDT header with a valid checksum.
+    fn make_rsdt(length: u32) -> [u8; 36] {
+        let mut h = [0u8; 36];
+        h[0..4].copy_from_slice(b"RSDT");
+        h[4..8].copy_from_slice(&length.to_le_bytes());
+        h[8] = 1; // revision
+        h[10..16].copy_from_slice(b"TEST01");
+        h[16..24].copy_from_slice(b"TESTRSDT");
+        // Compute checksum
+        h[9] = 0;
+        let s = h[..length as usize].iter().fold(0u8, |s, &x| s.wrapping_add(x));
+        h[9] = 0u8.wrapping_sub(s);
+        h
+    }
+
+    #[derive(Clone)]
+    struct TestHandler {
+        mem: &'static [u8],
+    }
+
+    impl AcpiHandler for TestHandler {
+        unsafe fn map_physical_region<T>(&self, physical_address: usize, size: usize) -> PhysicalMapping<Self, T> {
+            assert!(physical_address + size <= self.mem.len());
+            let ptr = unsafe { self.mem.as_ptr().add(physical_address) } as *const T;
+            unsafe {
+                PhysicalMapping::new(
+                    physical_address,
+                    NonNull::new(ptr as *mut T).unwrap(),
+                    size,
+                    size,
+                    self.clone(),
+                )
+            }
+        }
+
+        fn unmap_physical_region<T>(_region: &PhysicalMapping<Self, T>) {}
+    }
+
+    // --- Test 3: ACPI 2.0+ RSDP with zero XSDT address falls back to RSDT ---
+
+    #[test]
+    fn rev2_zero_xsdt_falls_back_to_rsdt() {
+        // Place RSDP at offset 0, RSDT at offset 0x100
+        let rsdt_offset = 0x100usize;
+        let buf_len = rsdt_offset + 36;
+
+        let mut buf: Vec<u8> = std::vec![0; buf_len];
+
+        // RSDP: revision 2, valid rsdt_address, xsdt_address = 0
+        let rsdp_bytes = make_rsdp(2, rsdt_offset as u32, 0, 36);
+        buf[0..36].copy_from_slice(&rsdp_bytes);
+
+        // RSDT header at rsdt_offset
+        let rsdt_bytes = make_rsdt(36); // header only, no entries
+        buf[rsdt_offset..rsdt_offset + 36].copy_from_slice(&rsdt_bytes);
+
+        let buf: &'static mut [u8] = Box::leak(buf.into_boxed_slice());
+        let handler = TestHandler { mem: buf };
+
+        // from_rsdp constructs AcpiTables using from_validated_rsdp internally
+        let result = unsafe { AcpiTables::from_rsdp(handler, 0) };
+        assert!(result.is_ok(), "Should fall back to RSDT when xsdt_address is 0");
     }
 }

@@ -5,7 +5,8 @@ use core::{mem, ops::Range, slice, str};
 const RSDP_V1_LENGTH: usize = 20;
 /// The total size in bytes of the RSDP fields introduced in ACPI 2.0.
 const RSDP_V2_EXT_LENGTH: usize = mem::size_of::<Rsdp>() - RSDP_V1_LENGTH;
-
+/// The size in bytes covered by the ACPI 2.0+ extended checksum (mirrors Linux ACPI_RSDP_XCHECKSUM_LENGTH).
+const RSDP_XCHECKSUM_LENGTH: usize = 36;
 /// The first structure found in ACPI. It just tells us where the RSDT is.
 ///
 /// On BIOS systems, it is either found in the first 1KiB of the Extended Bios Data Area, or between `0x000e0000`
@@ -15,10 +16,10 @@ const RSDP_V2_EXT_LENGTH: usize = mem::size_of::<Rsdp>() - RSDP_V1_LENGTH;
 /// The recommended way of locating the RSDP is to let the bootloader do it - Multiboot2 can pass a
 /// tag with the physical address of it. If this is not possible, a manual scan can be done.
 ///
-/// If `revision > 0`, (the hardware ACPI version is Version 2.0 or greater), the RSDP contains
-/// some new fields. For ACPI Version 1.0, these fields are not valid and should not be accessed.
-/// For ACPI Version 2.0+, `xsdt_address` should be used (truncated to `u32` on x86) instead of
-/// `rsdt_address`.
+/// If `revision >= 2`, the RSDP contains the extended fields introduced in ACPI 2.0. Revisions below 2 are
+/// handled as legacy RSDPs, matching Linux ACPICA, so these fields are not valid and should not be accessed.
+/// For ACPI Version 2.0+, `xsdt_address` should be used when it is non-zero (truncated to `u32` on x86);
+/// otherwise, `rsdt_address` should be used.
 #[derive(Clone, Copy, Debug)]
 #[repr(C, packed)]
 pub struct Rsdp {
@@ -112,22 +113,21 @@ impl Rsdp {
             return Err(AcpiError::RsdpInvalidOemId);
         }
 
-        /*
-         * `self.length` doesn't exist on ACPI version 1.0, so we mustn't rely on it. Instead,
-         * check for version 1.0 and use a hard-coded length instead.
-         */
-        let length = if self.revision > 0 {
-            // For Version 2.0+, include the number of bytes specified by `length`
-            self.length as usize
-        } else {
-            RSDP_V1_LENGTH
-        };
-
-        let bytes = unsafe { slice::from_raw_parts(self as *const Rsdp as *const u8, length) };
-        let sum = bytes.iter().fold(0u8, |sum, &byte| sum.wrapping_add(byte));
-
-        if sum != 0 {
+        // Always check the standard checksum over the first 20 bytes (ACPI 1.0 RSDP).
+        let standard_bytes = unsafe { slice::from_raw_parts(self as *const Rsdp as *const u8, RSDP_V1_LENGTH) };
+        let standard_sum = standard_bytes.iter().fold(0u8, |sum, &byte| sum.wrapping_add(byte));
+        if standard_sum != 0 {
             return Err(AcpiError::RsdpInvalidChecksum);
+        }
+
+        // For ACPI 2.0+ (revision >= 2), also check the extended checksum over 36 bytes.
+        if self.revision >= 2 {
+            let extended_bytes =
+                unsafe { slice::from_raw_parts(self as *const Rsdp as *const u8, RSDP_XCHECKSUM_LENGTH) };
+            let extended_sum = extended_bytes.iter().fold(0u8, |sum, &byte| sum.wrapping_add(byte));
+            if extended_sum != 0 {
+                return Err(AcpiError::RsdpInvalidChecksum);
+            }
         }
 
         Ok(())
@@ -154,17 +154,17 @@ impl Rsdp {
     }
 
     pub fn length(&self) -> u32 {
-        assert!(self.revision > 0, "Tried to read extended RSDP field with ACPI Version 1.0");
+        assert!(self.revision >= 2, "Tried to read extended RSDP field with ACPI Version < 2.0");
         self.length
     }
 
     pub fn xsdt_address(&self) -> u64 {
-        assert!(self.revision > 0, "Tried to read extended RSDP field with ACPI Version 1.0");
+        assert!(self.revision >= 2, "Tried to read extended RSDP field with ACPI Version < 2.0");
         self.xsdt_address
     }
 
     pub fn ext_checksum(&self) -> u8 {
-        assert!(self.revision > 0, "Tried to read extended RSDP field with ACPI Version 1.0");
+        assert!(self.revision >= 2, "Tried to read extended RSDP field with ACPI Version < 2.0");
         self.ext_checksum
     }
 }

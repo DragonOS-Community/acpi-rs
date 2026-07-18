@@ -32,7 +32,8 @@ pub enum RsdpError {
 const RSDP_V1_LENGTH: usize = 20;
 /// The total size in bytes of the RSDP fields introduced in ACPI 2.0.
 const RSDP_V2_EXT_LENGTH: usize = mem::size_of::<Rsdp>() - RSDP_V1_LENGTH;
-
+/// The size in bytes covered by the ACPI 2.0+ extended checksum (mirrors Linux ACPI_RSDP_XCHECKSUM_LENGTH).
+const RSDP_XCHECKSUM_LENGTH: usize = 36;
 /// The first structure found in ACPI. It just tells us where the RSDT is.
 ///
 /// On BIOS systems, it is either found in the first 1KB of the Extended Bios Data Area, or between
@@ -43,10 +44,10 @@ const RSDP_V2_EXT_LENGTH: usize = mem::size_of::<Rsdp>() - RSDP_V1_LENGTH;
 /// The recommended way of locating the RSDP is to let the bootloader do it - Multiboot2 can pass a
 /// tag with the physical address of it. If this is not possible, a manual scan can be done.
 ///
-/// If `revision > 0`, (the hardware ACPI version is Version 2.0 or greater), the RSDP contains
-/// some new fields. For ACPI Version 1.0, these fields are not valid and should not be accessed.
-/// For ACPI Version 2.0+, `xsdt_address` should be used (truncated to `u32` on x86) instead of
-/// `rsdt_address`.
+/// If `revision >= 2`, the RSDP contains the extended fields introduced in ACPI 2.0. Revisions below 2 are
+/// handled as legacy RSDPs, matching Linux ACPICA, so these fields are not valid and should not be accessed.
+/// For ACPI Version 2.0+, `xsdt_address` should be used when it is non-zero (truncated to `u32` on x86);
+/// otherwise, `rsdt_address` should be used.
 #[derive(Clone, Copy, Debug)]
 #[repr(C, packed)]
 pub struct Rsdp {
@@ -141,22 +142,21 @@ impl Rsdp {
             return Err(RsdpError::InvalidOemId);
         }
 
-        /*
-         * `self.length` doesn't exist on ACPI version 1.0, so we mustn't rely on it. Instead,
-         * check for version 1.0 and use a hard-coded length instead.
-         */
-        let length = if self.revision > 0 {
-            // For Version 2.0+, include the number of bytes specified by `length`
-            self.length as usize
-        } else {
-            RSDP_V1_LENGTH
-        };
-
-        let bytes = unsafe { slice::from_raw_parts(self as *const Rsdp as *const u8, length) };
-        let sum = bytes.iter().fold(0u8, |sum, &byte| sum.wrapping_add(byte));
-
-        if sum != 0 {
+        // Always check the standard checksum over the first 20 bytes (ACPI 1.0 RSDP).
+        let standard_bytes = unsafe { slice::from_raw_parts(self as *const Rsdp as *const u8, RSDP_V1_LENGTH) };
+        let standard_sum = standard_bytes.iter().fold(0u8, |sum, &byte| sum.wrapping_add(byte));
+        if standard_sum != 0 {
             return Err(RsdpError::InvalidChecksum);
+        }
+
+        // For ACPI 2.0+ (revision >= 2), also check the extended checksum over 36 bytes.
+        if self.revision >= 2 {
+            let extended_bytes =
+                unsafe { slice::from_raw_parts(self as *const Rsdp as *const u8, RSDP_XCHECKSUM_LENGTH) };
+            let extended_sum = extended_bytes.iter().fold(0u8, |sum, &byte| sum.wrapping_add(byte));
+            if extended_sum != 0 {
+                return Err(RsdpError::InvalidChecksum);
+            }
         }
 
         Ok(())
@@ -183,17 +183,17 @@ impl Rsdp {
     }
 
     pub fn length(&self) -> u32 {
-        assert!(self.revision > 0, "Tried to read extended RSDP field with ACPI Version 1.0");
+        assert!(self.revision >= 2, "Tried to read extended RSDP field with ACPI Version < 2.0");
         self.length
     }
 
     pub fn xsdt_address(&self) -> u64 {
-        assert!(self.revision > 0, "Tried to read extended RSDP field with ACPI Version 1.0");
+        assert!(self.revision >= 2, "Tried to read extended RSDP field with ACPI Version < 2.0");
         self.xsdt_address
     }
 
     pub fn ext_checksum(&self) -> u8 {
-        assert!(self.revision > 0, "Tried to read extended RSDP field with ACPI Version 1.0");
+        assert!(self.revision >= 2, "Tried to read extended RSDP field with ACPI Version < 2.0");
         self.ext_checksum
     }
 }
@@ -241,3 +241,181 @@ const RSDP_BIOS_AREA_START: usize = 0xe0000;
 const RSDP_BIOS_AREA_END: usize = 0xfffff;
 /// The RSDP (Root System Description Pointer)'s signature, "RSD PTR " (note trailing space)
 const RSDP_SIGNATURE: [u8; 8] = *b"RSD PTR ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::ptr::NonNull;
+    use std::{boxed::Box, vec::Vec};
+
+    /// Build a 36-byte RSDP with both checksums valid.
+    fn make_rsdp(revision: u8, rsdt_addr: u32, xsdt_addr: u64, length: u32) -> [u8; 36] {
+        let mut b = [0u8; 36];
+        b[0..8].copy_from_slice(b"RSD PTR ");
+        b[9..15].copy_from_slice(b"TEST01");
+        b[15] = revision;
+        b[16..20].copy_from_slice(&rsdt_addr.to_le_bytes());
+        b[20..24].copy_from_slice(&length.to_le_bytes());
+        b[24..32].copy_from_slice(&xsdt_addr.to_le_bytes());
+        // Standard 20-byte checksum
+        b[8] = 0;
+        let s = b[..RSDP_V1_LENGTH].iter().fold(0u8, |s, &x| s.wrapping_add(x));
+        b[8] = 0u8.wrapping_sub(s);
+        // Extended 36-byte checksum
+        b[32] = 0;
+        let s = b[..RSDP_XCHECKSUM_LENGTH].iter().fold(0u8, |s, &x| s.wrapping_add(x));
+        b[32] = 0u8.wrapping_sub(s);
+        b
+    }
+
+    unsafe fn as_rsdp(bytes: &[u8; 36]) -> &Rsdp {
+        unsafe { &*(bytes.as_ptr() as *const Rsdp) }
+    }
+
+    // --- Test 1: compensated checksum rejected ---
+    // An ACPI 2.0+ RSDP with a bad 20-byte standard checksum that happens to
+    // sum to zero over the full 36 bytes must still be rejected.
+
+    #[test]
+    fn compensated_checksum_rejected() {
+        let mut bytes = make_rsdp(2, 0x1000, 0xDEAD_BEEF, 36);
+        // Corrupt a byte inside the first 20 (not the checksum byte at offset 8)
+        bytes[10] ^= 1;
+        // Now the 20-byte sum is non-zero, but the 36-byte sum is also non-zero
+        // (we broke the 20-byte region which is a subset of the 36-byte region).
+        // Fix up the extended checksum so the 36-byte sum becomes 0 again,
+        // but leave the 20-byte sum broken.
+        bytes[32] = 0;
+        let ext_sum = bytes[..RSDP_XCHECKSUM_LENGTH].iter().fold(0u8, |s, &x| s.wrapping_add(x));
+        bytes[32] = 0u8.wrapping_sub(ext_sum);
+
+        let rsdp = unsafe { as_rsdp(&bytes) };
+        // The dual-stage check must reject this: standard checksum fails first.
+        assert_eq!(rsdp.validate(), Err(RsdpError::InvalidChecksum));
+    }
+
+    // --- Test 2: revision 1 behavior ---
+
+    #[test]
+    fn rev1_ignores_extended_checksum() {
+        let mut bytes = make_rsdp(1, 0x1000, 0, 0);
+        // Corrupt a byte in the extension area (bytes 20-35) — this is
+        // undefined for revision 1 and must not affect validation.
+        bytes[33] ^= 1;
+        let rsdp = unsafe { as_rsdp(&bytes) };
+        assert_eq!(rsdp.validate(), Ok(()));
+    }
+
+    #[test]
+    fn rev1_bad_standard_checksum_rejected() {
+        let mut bytes = make_rsdp(1, 0x1000, 0, 0);
+        // Corrupt a byte in the first 20
+        bytes[10] ^= 1;
+        let rsdp = unsafe { as_rsdp(&bytes) };
+        assert_eq!(rsdp.validate(), Err(RsdpError::InvalidChecksum));
+    }
+
+    #[test]
+    #[should_panic(expected = "Tried to read extended RSDP field with ACPI Version < 2.0")]
+    fn rev1_length_panics() {
+        let bytes = make_rsdp(1, 0x1000, 0, 0);
+        let rsdp = unsafe { as_rsdp(&bytes) };
+        let _ = rsdp.length();
+    }
+
+    #[test]
+    #[should_panic(expected = "Tried to read extended RSDP field with ACPI Version < 2.0")]
+    fn rev1_xsdt_address_panics() {
+        let bytes = make_rsdp(1, 0x1000, 0, 0);
+        let rsdp = unsafe { as_rsdp(&bytes) };
+        let _ = rsdp.xsdt_address();
+    }
+
+    // --- Mock handler for BIOS search tests ---
+
+    /// A handler that treats physical addresses as offsets into a static buffer.
+    #[derive(Clone)]
+    struct TestHandler {
+        mem: &'static [u8],
+    }
+
+    impl AcpiHandler for TestHandler {
+        unsafe fn map_physical_region<T>(&self, physical_address: usize, size: usize) -> PhysicalMapping<Self, T> {
+            assert!(physical_address + size <= self.mem.len());
+            let ptr = unsafe { self.mem.as_ptr().add(physical_address) } as *const T;
+            unsafe {
+                PhysicalMapping::new(
+                    physical_address,
+                    NonNull::new(ptr as *mut T).unwrap(),
+                    size,
+                    size,
+                    self.clone(),
+                )
+            }
+        }
+
+        fn unmap_physical_region<T>(_region: &PhysicalMapping<Self, T>) {}
+    }
+
+    // --- Test 4: last aligned RSDP in BIOS search area ---
+
+    #[test]
+    fn last_aligned_rsdp_in_bios_area() {
+        // The BIOS search area is 0xE0000..0x100000. The scan maps
+        // area.start..area.end+RSDP_V2_EXT_LENGTH, so we need a buffer
+        // covering [0, 0x100010).
+        let area_start = RSDP_BIOS_AREA_START;
+        let area_end = RSDP_BIOS_AREA_END + 1;
+        let buf_len = area_end + RSDP_V2_EXT_LENGTH; // 0x100010
+
+        let mut buf: Vec<u8> = std::vec![0; buf_len];
+
+        // Place a valid RSDP at the last 16-byte-aligned position.
+        // The extended scan window (step_by(16)) visits offsets
+        // area_start + N*16 within the search area as long as
+        // N*16 <= area_end - area_start + RSDP_V2_EXT_LENGTH - size_of::<Rsdp>().
+        let window_end = area_end - area_start + RSDP_V2_EXT_LENGTH - mem::size_of::<Rsdp>();
+        let last_offset = window_end - (window_end % 16);
+        let rsdp_phys = area_start + last_offset;
+
+        let rsdp_bytes = make_rsdp(0, 0x1000, 0, 0); // ACPI 1.0 RSDP
+        buf[rsdp_phys..rsdp_phys + 36].copy_from_slice(&rsdp_bytes);
+
+        let buf: &'static mut [u8] = Box::leak(buf.into_boxed_slice());
+        let handler = TestHandler { mem: buf };
+
+        let result = unsafe { Rsdp::search_for_on_bios(handler) };
+        assert!(result.is_ok(), "Should find RSDP at last aligned position");
+        assert_eq!(result.unwrap().physical_start(), rsdp_phys);
+    }
+
+    #[test]
+    fn last_aligned_rsdp_in_ebda_area() {
+        // Place a valid EBDA segment pointer at 0x40e so find_search_areas
+        // uses the specific EBDA range. We point it to 0x90000 (first KiB).
+        let ebda_seg: u16 = (0x90000 >> 4) as u16;
+        let ebda_start = (ebda_seg as usize) << 4; // 0x90000
+
+        // The buffer must cover the BIOS search area (searched first) through
+        // the EBDA area. Use the BIOS area end as a lower bound.
+        let buf_len =
+            usize::max(RSDP_BIOS_AREA_END + 1 + RSDP_V2_EXT_LENGTH, ebda_start + 1024 + RSDP_V2_EXT_LENGTH);
+
+        let mut buf: Vec<u8> = std::vec![0; buf_len];
+        buf[EBDA_START_SEGMENT_PTR..EBDA_START_SEGMENT_PTR + 2].copy_from_slice(&ebda_seg.to_le_bytes());
+
+        // Place RSDP at the last 16-byte-aligned position in the EBDA KiB
+        let window_end = 1024 + RSDP_V2_EXT_LENGTH - mem::size_of::<Rsdp>();
+        let last_offset = window_end - (window_end % 16);
+        let rsdp_phys = ebda_start + last_offset;
+        let rsdp_bytes = make_rsdp(0, 0x1000, 0, 0);
+        buf[rsdp_phys..rsdp_phys + 36].copy_from_slice(&rsdp_bytes);
+
+        let buf: &'static mut [u8] = Box::leak(buf.into_boxed_slice());
+        let handler = TestHandler { mem: buf };
+
+        let result = unsafe { Rsdp::search_for_on_bios(handler) };
+        assert!(result.is_ok(), "Should find RSDP at last aligned position in EBDA");
+        assert_eq!(result.unwrap().physical_start(), rsdp_phys);
+    }
+}
